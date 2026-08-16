@@ -28,3 +28,6 @@
 [submodule "dependencies/OpenXR-SDK"]
 	path = dependencies/OpenXR-SDK
 	url = https://github.com/KhronosGroup/OpenXR-SDK.git
+[submodule "dependencies/c-blosc"]
+	path = dependencies/c-blosc
+	url = https://github.com/Blosc/c-blosc
