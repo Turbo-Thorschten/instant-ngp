@@ -126,6 +126,18 @@ Testbed::NetworkDims Testbed::network_dims_scalar_volume() const {
 	return dims;
 }
 
+void Testbed::ScalarVolume::PinnedBuffer::resize(size_t n_bytes) {
+	free();
+	CUDA_CHECK_THROW(cudaHostAlloc((void**)&m_data, n_bytes, cudaHostAllocMapped));
+}
+
+void Testbed::ScalarVolume::PinnedBuffer::free() {
+	if (m_data) {
+		cudaFreeHost(m_data);
+		m_data = nullptr;
+	}
+}
+
 static ScalarVolumeLevels scalar_volume_levels(const Testbed::ScalarVolume& volume) {
 	ScalarVolumeLevels result;
 	result.n_levels = (uint32_t)volume.levels.size();
@@ -514,6 +526,17 @@ void Testbed::load_scalar_volume(const fs::path& data_path) {
 		total_bytes += (size_t)info.resolution.x * info.resolution.y * info.resolution.z;
 	}
 
+	bool use_pinned = m_scalar_volume_gt_storage == EGtStorage::Pinned;
+	if (m_scalar_volume_gt_storage == EGtStorage::Auto) {
+		size_t free_bytes = 0, total_vram_bytes = 0;
+		CUDA_CHECK_THROW(cudaMemGetInfo(&free_bytes, &total_vram_bytes));
+
+		// The network is not allocated yet at this point; the 60% margin is meant to leave room for it.
+		use_pinned = (double)total_bytes > 0.6 * (double)free_bytes;
+		tlog::info() << "Ground truth is " << bytes_to_string(total_bytes) << ", free VRAM is " << bytes_to_string(free_bytes)
+					 << "; choosing " << (use_pinned ? "pinned host" : "vram") << " storage";
+	}
+
 	m_scalar_volume.levels.clear();
 	m_scalar_volume.levels.resize(infos.size());
 
@@ -531,10 +554,16 @@ void Testbed::load_scalar_volume(const fs::path& data_path) {
 		level.resolution = info.resolution;
 		level.begin = info.begin;
 
-		std::vector<uint8_t> host_data(n_voxels);
-		read_zarr_level(level_path, info, host_data.data());
-		level.vram.resize_and_copy_from_host(host_data);
-		level.data = level.vram.data();
+		if (use_pinned) {
+			level.pinned.resize(n_voxels);
+			read_zarr_level(level_path, info, level.pinned.data());
+			level.data = level.pinned.data();
+		} else {
+			std::vector<uint8_t> host_data(n_voxels);
+			read_zarr_level(level_path, info, host_data.data());
+			level.vram.resize_and_copy_from_host(host_data);
+			level.data = level.vram.data();
+		}
 	}
 
 	m_scalar_volume.resolution = m_scalar_volume.levels.front().resolution;
@@ -544,7 +573,8 @@ void Testbed::load_scalar_volume(const fs::path& data_path) {
 	m_aabb = m_render_aabb = BoundingBox{vec3(0.0f), vec3(1.0f)};
 	m_render_aabb_to_local = mat3::identity();
 
-	tlog::success() << "Loaded " << infos.size() << " scalar volume levels (" << bytes_to_string(total_bytes) << ") after "
+	tlog::success() << "Loaded " << infos.size() << " scalar volume levels (" << bytes_to_string(total_bytes) << ") into "
+					<< (use_pinned ? "pinned host memory" : "vram") << " after "
 					<< tlog::durationToString(std::chrono::steady_clock::now() - start);
 }
 

@@ -985,11 +985,41 @@ public:
 		ERandomMode random_mode = ERandomMode::Stratified;
 	} m_image;
 
+	enum class EGtStorage {
+		Vram,
+		Pinned,
+		Auto,
+	};
+
+	EGtStorage m_scalar_volume_gt_storage = EGtStorage::Auto;
 	uint32_t m_scalar_volume_curriculum_steps = 250;
 
 	struct ScalarVolume {
+		// Page-locked host memory whose pointer is directly dereferenceable from device code (UVA).
+		class PinnedBuffer {
+		public:
+			PinnedBuffer() = default;
+			PinnedBuffer(const PinnedBuffer&) = delete;
+			PinnedBuffer& operator=(const PinnedBuffer&) = delete;
+			PinnedBuffer(PinnedBuffer&& other) noexcept { *this = std::move(other); }
+			PinnedBuffer& operator=(PinnedBuffer&& other) noexcept {
+				std::swap(m_data, other.m_data);
+				return *this;
+			}
+			~PinnedBuffer() { free(); }
+
+			void resize(size_t n_bytes);
+			void free();
+
+			uint8_t* data() const { return m_data; }
+
+		private:
+			uint8_t* m_data = nullptr;
+		};
+
 		struct Level {
 			GPUMemory<uint8_t> vram;
+			PinnedBuffer pinned;
 			const uint8_t* data = nullptr;
 			ivec3 resolution = ivec3(0);
 			ivec3 begin = ivec3(0);

@@ -110,6 +110,13 @@ int main_func(const std::vector<std::string>& arguments) {
 		{"curriculum-steps"},
 	};
 
+	ValueFlag<string> gt_storage_flag{
+		parser,
+		"GT_STORAGE",
+		"Where to keep the ScalarVolume ground truth: 'vram', 'pinned' (host memory) or 'auto'.",
+		{"gt-storage"},
+	};
+
 	ValueFlag<uint32_t> width_flag{
 		parser,
 		"WIDTH",
@@ -173,6 +180,20 @@ int main_func(const std::vector<std::string>& arguments) {
 
 	if (curriculum_steps_flag) {
 		testbed.m_scalar_volume_curriculum_steps = get(curriculum_steps_flag);
+	}
+
+	if (gt_storage_flag) {
+		const string storage = get(gt_storage_flag);
+		if (storage == "vram") {
+			testbed.m_scalar_volume_gt_storage = Testbed::EGtStorage::Vram;
+		} else if (storage == "pinned") {
+			testbed.m_scalar_volume_gt_storage = Testbed::EGtStorage::Pinned;
+		} else if (storage == "auto") {
+			testbed.m_scalar_volume_gt_storage = Testbed::EGtStorage::Auto;
+		} else {
+			tlog::error() << "Unknown --gt-storage '" << storage << "'. Must be one of vram, pinned, auto.";
+			return -1;
+		}
 	}
 
 	for (auto file : get(files)) {
