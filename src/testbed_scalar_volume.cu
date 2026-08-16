@@ -81,14 +81,20 @@ inline NGP_HOST_DEVICE float sample_scalar_volume(const ScalarVolumeLevels& leve
 }
 
 __global__ void eval_scalar_volume_kernel(
-	uint32_t n_elements, ScalarVolumeLevels levels, uint32_t level, const vec4* __restrict__ positions, float* __restrict__ result
+	uint32_t n_elements,
+	ScalarVolumeLevels levels,
+	uint32_t level,
+	uint32_t n_input_dims,
+	const float* __restrict__ positions,
+	float* __restrict__ result
 ) {
 	uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= n_elements) {
 		return;
 	}
 
-	result[i] = sample_scalar_volume(levels, level, vec3(positions[i]));
+	const float* __restrict__ pos = positions + (size_t)i * n_input_dims;
+	result[i] = sample_scalar_volume(levels, level, vec3(pos[0], pos[1], pos[2]));
 }
 
 // Consumes the 4th uniform random number of each sample to draw its level and replaces it with the level's scale s.
@@ -119,8 +125,24 @@ __global__ void sample_scalar_volume_kernel(
 }
 
 Testbed::NetworkDims Testbed::network_dims_scalar_volume() const {
+	// The scale-conditioned R^4 field needs the Composite encoding (grid over x, OneBlob over s); every other
+	// encoding is fed the plain R^3 position of level 0.
+	const std::string encoding_otype = m_network_config.contains("encoding") ?
+		m_network_config["encoding"].value("otype", std::string{}) :
+		std::string{};
+	const uint32_t n_config_input_dims = equals_case_insensitive(encoding_otype, "Composite") ? 4u : 3u;
+
+	if (n_config_input_dims != m_scalar_volume_input_dims) {
+		throw std::runtime_error{fmt::format(
+			"ScalarVolume runs with {} input dims (--scale-dim), but the network config's '{}' encoding takes {}.",
+			m_scalar_volume_input_dims,
+			encoding_otype,
+			n_config_input_dims
+		)};
+	}
+
 	NetworkDims dims;
-	dims.n_input = 4;
+	dims.n_input = m_scalar_volume_input_dims;
 	dims.n_output = 1;
 	dims.n_pos = 3;
 	return dims;
@@ -175,17 +197,22 @@ static ScalarVolumeLevelCdf scalar_volume_level_cdf(uint32_t n_levels, uint32_t 
 
 void Testbed::train_scalar_volume(size_t target_batch_size, bool get_loss_scalar, cudaStream_t stream) {
 	const uint32_t n_output_dims = 1;
-	const uint32_t n_input_dims = 4;
+	const uint32_t n_input_dims = m_scalar_volume_input_dims;
 
 	const uint32_t batch_size = (uint32_t)target_batch_size;
 	const uint32_t n_levels = (uint32_t)m_scalar_volume.levels.size();
+
+	if (n_input_dims == 3 && m_scalar_volume_curriculum_steps > 0) {
+		tlog::warning() << "Ignoring --curriculum-steps: the 3D ScalarVolume mode only trains against level 0.";
+		m_scalar_volume_curriculum_steps = 0;
+	}
 
 	uint32_t n_unlocked_levels = n_levels;
 	if (m_scalar_volume_curriculum_steps > 0) {
 		n_unlocked_levels = std::min(n_levels, 1 + (uint32_t)(m_training_step / m_scalar_volume_curriculum_steps));
 	}
 
-	if (n_unlocked_levels != m_scalar_volume.n_unlocked_levels) {
+	if (n_input_dims == 4 && n_unlocked_levels != m_scalar_volume.n_unlocked_levels) {
 		m_scalar_volume.n_unlocked_levels = n_unlocked_levels;
 		tlog::info() << "step=" << m_training_step << " curriculum unlocked levels " << (n_levels - n_unlocked_levels) << ".."
 					 << (n_levels - 1);
@@ -196,17 +223,31 @@ void Testbed::train_scalar_volume(size_t target_batch_size, bool get_loss_scalar
 
 	generate_random_uniform<float>(stream, m_rng, batch_size * n_input_dims, (float*)m_scalar_volume.training.positions.data());
 
-	linear_kernel(
-		sample_scalar_volume_kernel,
-		0,
-		stream,
-		batch_size,
-		scalar_volume_levels(m_scalar_volume),
-		scalar_volume_level_cdf(n_levels, n_unlocked_levels),
-		1.0f / (float)n_levels,
-		m_scalar_volume.training.positions.data(),
-		m_scalar_volume.training.targets.data()
-	);
+	if (n_input_dims == 4) {
+		linear_kernel(
+			sample_scalar_volume_kernel,
+			0,
+			stream,
+			batch_size,
+			scalar_volume_levels(m_scalar_volume),
+			scalar_volume_level_cdf(n_levels, n_unlocked_levels),
+			1.0f / (float)n_levels,
+			m_scalar_volume.training.positions.data(),
+			m_scalar_volume.training.targets.data()
+		);
+	} else {
+		linear_kernel(
+			eval_scalar_volume_kernel,
+			0,
+			stream,
+			batch_size,
+			scalar_volume_levels(m_scalar_volume),
+			0u,
+			n_input_dims,
+			(const float*)m_scalar_volume.training.positions.data(),
+			m_scalar_volume.training.targets.data()
+		);
+	}
 
 	GPUMatrix<float> training_batch_matrix((float*)m_scalar_volume.training.positions.data(), n_input_dims, batch_size);
 	GPUMatrix<float> training_target_matrix(m_scalar_volume.training.targets.data(), n_output_dims, batch_size);
@@ -221,7 +262,8 @@ void Testbed::train_scalar_volume(size_t target_batch_size, bool get_loss_scalar
 
 __global__ void init_scalar_volume_coords(
 	uint32_t sample_index,
-	vec4* __restrict__ positions,
+	uint32_t n_input_dims,
+	float* __restrict__ positions,
 	float* __restrict__ depth_buffer,
 	ivec2 resolution,
 	vec2 focal_length,
@@ -259,20 +301,36 @@ __global__ void init_scalar_volume_coords(
 	);
 
 	uint32_t idx = x + resolution.x * y;
+	float* __restrict__ out = positions + (size_t)idx * n_input_dims;
+
 	if (!ray.is_valid()) {
 		depth_buffer[idx] = MAX_DEPTH();
-		positions[idx] = vec4(-1.0f, -1.0f, -1.0f, 0.0f);
+		out[0] = out[1] = out[2] = -1.0f;
+		if (n_input_dims > 3) {
+			out[3] = 0.0f;
+		}
+
 		return;
 	}
 
 	// plane_z is negative, so this lands on the slicing plane in front of the camera.
 	const vec3 pos = ray.o - plane_z * ray.d;
-	positions[idx] = vec4(pos.x, pos.y, pos.z, 0.0f);
+	out[0] = pos.x;
+	out[1] = pos.y;
+	out[2] = pos.z;
+	if (n_input_dims > 3) {
+		out[3] = 0.0f;
+	}
+
 	depth_buffer[idx] = -plane_z;
 }
 
 __global__ void shade_kernel_scalar_volume(
-	ivec2 resolution, const vec4* __restrict__ positions, const float* __restrict__ values, vec4* __restrict__ frame_buffer
+	ivec2 resolution,
+	uint32_t n_input_dims,
+	const float* __restrict__ positions,
+	const float* __restrict__ values,
+	vec4* __restrict__ frame_buffer
 ) {
 	uint32_t x = threadIdx.x + blockDim.x * blockIdx.x;
 	uint32_t y = threadIdx.y + blockDim.y * blockIdx.y;
@@ -283,7 +341,8 @@ __global__ void shade_kernel_scalar_volume(
 
 	uint32_t idx = x + resolution.x * y;
 
-	const vec3 pos = vec3(positions[idx]);
+	const float* __restrict__ p = positions + (size_t)idx * n_input_dims;
+	const vec3 pos = vec3(p[0], p[1], p[2]);
 	if (pos.x < 0.0f || pos.x > 1.0f || pos.y < 0.0f || pos.y > 1.0f || pos.z < 0.0f || pos.z > 1.0f) {
 		frame_buffer[idx] = vec4(0.0f);
 		return;
@@ -304,6 +363,7 @@ void Testbed::render_scalar_volume(
 ) {
 	auto res = render_buffer.resolution;
 
+	const uint32_t n_input_dims = m_scalar_volume_input_dims;
 	size_t n_pixels = (size_t)res.x * res.y;
 	uint32_t n_elements = next_multiple((uint32_t)n_pixels, BATCH_SIZE_GRANULARITY);
 	m_scalar_volume.render_coords.enlarge(n_elements);
@@ -318,7 +378,8 @@ void Testbed::render_scalar_volume(
 	const dim3 blocks = {div_round_up((uint32_t)res.x, threads.x), div_round_up((uint32_t)res.y, threads.y), 1};
 	init_scalar_volume_coords<<<blocks, threads, 0, stream>>>(
 		render_buffer.spp,
-		m_scalar_volume.render_coords.data(),
+		n_input_dims,
+		(float*)m_scalar_volume.render_coords.data(),
 		render_buffer.depth_buffer,
 		res,
 		focal_length,
@@ -339,18 +400,19 @@ void Testbed::render_scalar_volume(
 			stream,
 			n_elements,
 			scalar_volume_levels(m_scalar_volume),
-			0,
-			m_scalar_volume.render_coords.data(),
+			0u,
+			n_input_dims,
+			(const float*)m_scalar_volume.render_coords.data(),
 			m_scalar_volume.render_out.data()
 		);
 	} else {
-		GPUMatrix<float> positions_matrix((float*)m_scalar_volume.render_coords.data(), 4, n_elements);
+		GPUMatrix<float> positions_matrix((float*)m_scalar_volume.render_coords.data(), n_input_dims, n_elements);
 		GPUMatrix<float, RM> values_matrix(m_scalar_volume.render_out.data(), 1, n_elements);
 		m_network->inference(stream, positions_matrix, values_matrix);
 	}
 
 	shade_kernel_scalar_volume<<<blocks, threads, 0, stream>>>(
-		res, m_scalar_volume.render_coords.data(), m_scalar_volume.render_out.data(), render_buffer.frame_buffer
+		res, n_input_dims, (const float*)m_scalar_volume.render_coords.data(), m_scalar_volume.render_out.data(), render_buffer.frame_buffer
 	);
 }
 
@@ -507,8 +569,11 @@ static void read_zarr_level(const fs::path& level_path, const ZarrLevelInfo& inf
 void Testbed::load_scalar_volume(const fs::path& data_path) {
 	auto start = std::chrono::steady_clock::now();
 
+	// Without a scale input there is nothing to fit the coarse levels to, so only level 0 is read.
+	const uint32_t max_levels = m_scalar_volume_input_dims == 4 ? MAX_SCALAR_VOLUME_LEVELS : 1;
+
 	std::vector<ZarrLevelInfo> infos;
-	for (uint32_t l = 0; l < MAX_SCALAR_VOLUME_LEVELS; ++l) {
+	for (uint32_t l = 0; l < max_levels; ++l) {
 		const fs::path level_path = data_path / std::to_string(l);
 		if (!(level_path / ".zarray").exists()) {
 			break;
@@ -579,7 +644,7 @@ void Testbed::load_scalar_volume(const fs::path& data_path) {
 }
 
 __global__ void scalar_volume_slice_coords(
-	uint32_t n_elements, uint32_t offset, int z, ivec3 resolution, float s, vec4* __restrict__ positions
+	uint32_t n_elements, uint32_t offset, int z, ivec3 resolution, float s, uint32_t n_input_dims, float* __restrict__ positions
 ) {
 	uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= n_elements) {
@@ -588,7 +653,14 @@ __global__ void scalar_volume_slice_coords(
 
 	const uint32_t idx = min(i + offset, (uint32_t)resolution.x * resolution.y - 1);
 	const vec3 pos = (vec3{(float)(idx % resolution.x), (float)(idx / resolution.x), (float)z} + 0.5f) / vec3(resolution);
-	positions[i] = vec4(pos.x, pos.y, pos.z, s);
+
+	float* __restrict__ out = positions + (size_t)i * n_input_dims;
+	out[0] = pos.x;
+	out[1] = pos.y;
+	out[2] = pos.z;
+	if (n_input_dims > 3) {
+		out[3] = s;
+	}
 }
 
 void Testbed::save_scalar_volume_slices(const fs::path& dir) {
@@ -607,6 +679,7 @@ void Testbed::save_scalar_volume_slices(const fs::path& dir) {
 
 	const uint32_t n_levels = (uint32_t)m_scalar_volume.levels.size();
 	const float inv_n_levels = 1.0f / (float)n_levels;
+	const uint32_t n_input_dims = m_scalar_volume_input_dims;
 	const auto levels = scalar_volume_levels(m_scalar_volume);
 
 	GPUMemory<vec4> positions(max_batch_size);
@@ -633,10 +706,14 @@ void Testbed::save_scalar_volume_slices(const fs::path& dir) {
 			const uint32_t n = std::min(max_batch_size, n_pixels - offset);
 			const uint32_t batch_size = next_multiple(n, BATCH_SIZE_GRANULARITY);
 
-			linear_kernel(scalar_volume_slice_coords, 0, nullptr, batch_size, offset, z, resolution, s, positions.data());
-			linear_kernel(eval_scalar_volume_kernel, 0, nullptr, batch_size, levels, level, positions.data(), targets.data());
+			linear_kernel(
+				scalar_volume_slice_coords, 0, nullptr, batch_size, offset, z, resolution, s, n_input_dims, (float*)positions.data()
+			);
+			linear_kernel(
+				eval_scalar_volume_kernel, 0, nullptr, batch_size, levels, level, n_input_dims, (const float*)positions.data(), targets.data()
+			);
 
-			GPUMatrix<float> positions_matrix((float*)positions.data(), 4, batch_size);
+			GPUMatrix<float> positions_matrix((float*)positions.data(), n_input_dims, batch_size);
 			GPUMatrix<float, RM> predictions_matrix(predictions.data(), 1, batch_size);
 			m_network->inference(positions_matrix, predictions_matrix);
 
@@ -705,7 +782,7 @@ void Testbed::save_scalar_volume_slices(const fs::path& dir) {
 }
 
 __global__ void scalar_volume_voxel_coords(
-	uint32_t n_elements, size_t offset, size_t n_voxels, ivec3 resolution, float s, vec4* __restrict__ positions
+	uint32_t n_elements, size_t offset, size_t n_voxels, ivec3 resolution, float s, uint32_t n_input_dims, float* __restrict__ positions
 ) {
 	uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= n_elements) {
@@ -718,7 +795,14 @@ __global__ void scalar_volume_voxel_coords(
 
 	const vec3 pos = (vec3{(float)(in_slice % resolution.x), (float)(in_slice / resolution.x), (float)(linear / n_per_slice)} + 0.5f) /
 		vec3(resolution);
-	positions[i] = vec4(pos.x, pos.y, pos.z, s);
+
+	float* __restrict__ out = positions + (size_t)i * n_input_dims;
+	out[0] = pos.x;
+	out[1] = pos.y;
+	out[2] = pos.z;
+	if (n_input_dims > 3) {
+		out[3] = s;
+	}
 }
 
 __global__ void scalar_volume_squared_error_kernel(
@@ -765,6 +849,7 @@ void Testbed::scalar_volume_psnr() {
 	const ivec3 resolution = m_scalar_volume.resolution;
 	const size_t n_voxels = (size_t)resolution.x * resolution.y * resolution.z;
 	const uint32_t max_batch_size = 1u << 20;
+	const uint32_t n_input_dims = m_scalar_volume_input_dims;
 	const auto levels = scalar_volume_levels(m_scalar_volume);
 
 	GPUMemory<vec4> positions(max_batch_size);
@@ -777,10 +862,14 @@ void Testbed::scalar_volume_psnr() {
 		const uint32_t n = (uint32_t)std::min((size_t)max_batch_size, n_voxels - offset);
 		const uint32_t batch_size = next_multiple(n, BATCH_SIZE_GRANULARITY);
 
-		linear_kernel(scalar_volume_voxel_coords, 0, nullptr, batch_size, offset, n_voxels, resolution, 0.0f, positions.data());
-		linear_kernel(eval_scalar_volume_kernel, 0, nullptr, batch_size, levels, 0u, positions.data(), targets.data());
+		linear_kernel(
+			scalar_volume_voxel_coords, 0, nullptr, batch_size, offset, n_voxels, resolution, 0.0f, n_input_dims, (float*)positions.data()
+		);
+		linear_kernel(
+			eval_scalar_volume_kernel, 0, nullptr, batch_size, levels, 0u, n_input_dims, (const float*)positions.data(), targets.data()
+		);
 
-		GPUMatrix<float> positions_matrix((float*)positions.data(), 4, batch_size);
+		GPUMatrix<float> positions_matrix((float*)positions.data(), n_input_dims, batch_size);
 		GPUMatrix<float, RM> predictions_matrix(predictions.data(), 1, batch_size);
 		m_network->inference(positions_matrix, predictions_matrix);
 

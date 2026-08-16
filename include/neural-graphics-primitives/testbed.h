@@ -996,6 +996,9 @@ public:
 	EGtStorage m_scalar_volume_gt_storage = EGtStorage::Auto;
 	uint32_t m_scalar_volume_curriculum_steps = 250;
 
+	// 3: f(x) over level 0 only. 4: f(x, s) over all levels, which requires a Composite encoding.
+	uint32_t m_scalar_volume_input_dims = 3;
+
 	struct ScalarVolume {
 		// Page-locked host memory whose pointer is directly dereferenceable from device code (UVA).
 		class PinnedBuffer {

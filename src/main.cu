@@ -124,6 +124,13 @@ int main_func(const std::vector<std::string>& arguments) {
 		{"curriculum-steps"},
 	};
 
+	ValueFlag<uint32_t> scale_dim_flag{
+		parser,
+		"SCALE_DIM",
+		"Number of ScalarVolume input dims: 3 fits level 0 only, 4 fits all levels conditioned on the scale s.",
+		{"scale-dim"},
+	};
+
 	ValueFlag<string> gt_storage_flag{
 		parser,
 		"GT_STORAGE",
@@ -194,6 +201,16 @@ int main_func(const std::vector<std::string>& arguments) {
 
 	if (curriculum_steps_flag) {
 		testbed.m_scalar_volume_curriculum_steps = get(curriculum_steps_flag);
+	}
+
+	if (scale_dim_flag) {
+		const uint32_t scale_dim = get(scale_dim_flag);
+		if (scale_dim != 3 && scale_dim != 4) {
+			tlog::error() << "--scale-dim must be 3 or 4.";
+			return -1;
+		}
+
+		testbed.m_scalar_volume_input_dims = scale_dim;
 	}
 
 	if (gt_storage_flag) {
