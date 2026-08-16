@@ -704,4 +704,224 @@ void Testbed::save_scalar_volume_slices(const fs::path& dir) {
 	tlog::success() << "Wrote slice images to " << dir;
 }
 
+__global__ void scalar_volume_voxel_coords(
+	uint32_t n_elements, size_t offset, size_t n_voxels, ivec3 resolution, float s, vec4* __restrict__ positions
+) {
+	uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n_elements) {
+		return;
+	}
+
+	const size_t linear = offset + i < n_voxels ? offset + i : n_voxels - 1;
+	const size_t n_per_slice = (size_t)resolution.x * resolution.y;
+	const size_t in_slice = linear % n_per_slice;
+
+	const vec3 pos = (vec3{(float)(in_slice % resolution.x), (float)(in_slice / resolution.x), (float)(linear / n_per_slice)} + 0.5f) /
+		vec3(resolution);
+	positions[i] = vec4(pos.x, pos.y, pos.z, s);
+}
+
+__global__ void scalar_volume_squared_error_kernel(
+	uint32_t n_elements, const float* __restrict__ targets, const float* __restrict__ predictions, double* __restrict__ accum
+) {
+	__shared__ double sdata[N_THREADS_LINEAR];
+
+	const uint32_t tid = threadIdx.x;
+	const uint32_t i = blockIdx.x * blockDim.x + tid;
+
+	double v = 0.0;
+	if (i < n_elements) {
+		const double diff = (double)targets[i] - (double)predictions[i];
+		v = diff * diff;
+	}
+
+	sdata[tid] = v;
+	__syncthreads();
+
+	for (uint32_t stride = N_THREADS_LINEAR / 2; stride > 0; stride >>= 1) {
+		if (tid < stride) {
+			sdata[tid] += sdata[tid + stride];
+		}
+
+		__syncthreads();
+	}
+
+	if (tid == 0) {
+		atomicAdd(accum, sdata[0]);
+	}
+}
+
+void Testbed::scalar_volume_psnr() {
+	if (m_testbed_mode != ETestbedMode::ScalarVolume) {
+		throw std::runtime_error{"Volume PSNR requires the ScalarVolume mode."};
+	}
+
+	if (!m_network) {
+		throw std::runtime_error{"Volume PSNR requires a network."};
+	}
+
+	auto start = std::chrono::steady_clock::now();
+
+	const ivec3 resolution = m_scalar_volume.resolution;
+	const size_t n_voxels = (size_t)resolution.x * resolution.y * resolution.z;
+	const uint32_t max_batch_size = 1u << 20;
+	const auto levels = scalar_volume_levels(m_scalar_volume);
+
+	GPUMemory<vec4> positions(max_batch_size);
+	GPUMemory<float> targets(max_batch_size);
+	GPUMemory<float> predictions(max_batch_size);
+	GPUMemory<double> accum(1);
+	accum.memset(0);
+
+	for (size_t offset = 0; offset < n_voxels; offset += max_batch_size) {
+		const uint32_t n = (uint32_t)std::min((size_t)max_batch_size, n_voxels - offset);
+		const uint32_t batch_size = next_multiple(n, BATCH_SIZE_GRANULARITY);
+
+		linear_kernel(scalar_volume_voxel_coords, 0, nullptr, batch_size, offset, n_voxels, resolution, 0.0f, positions.data());
+		linear_kernel(eval_scalar_volume_kernel, 0, nullptr, batch_size, levels, 0u, positions.data(), targets.data());
+
+		GPUMatrix<float> positions_matrix((float*)positions.data(), 4, batch_size);
+		GPUMatrix<float, RM> predictions_matrix(predictions.data(), 1, batch_size);
+		m_network->inference(positions_matrix, predictions_matrix);
+
+		linear_kernel(scalar_volume_squared_error_kernel, 0, nullptr, n, targets.data(), predictions.data(), accum.data());
+	}
+
+	std::vector<double> squared_error(1);
+	accum.copy_to_host(squared_error);
+
+	const double mse = squared_error[0] / (double)n_voxels;
+
+	tlog::info() << fmt::format(
+		"Volume s=0.000 level=0 voxels={} mse={:e} psnr={:.2f}dB (took {})",
+		n_voxels,
+		mse,
+		-10.0 * std::log10(mse),
+		tlog::durationToString(std::chrono::steady_clock::now() - start)
+	);
+}
+
+static constexpr uint32_t QUANTIZATION_BLOCK_SIZE = 1024;
+
+__global__ void quantize_params_kernel(
+	size_t n_params, int q_max, network_precision_t* __restrict__ params, int16_t* __restrict__ quantized, __half* __restrict__ scales
+) {
+	__shared__ float sdata[QUANTIZATION_BLOCK_SIZE];
+
+	const uint32_t tid = threadIdx.x;
+	const size_t i = (size_t)blockIdx.x * QUANTIZATION_BLOCK_SIZE + tid;
+
+	const float v = i < n_params ? (float)params[i] : 0.0f;
+
+	sdata[tid] = fabsf(v);
+	__syncthreads();
+
+	for (uint32_t stride = QUANTIZATION_BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+		if (tid < stride) {
+			sdata[tid] = fmaxf(sdata[tid], sdata[tid + stride]);
+		}
+
+		__syncthreads();
+	}
+
+	// The scale is round-tripped through half so that the dumped blob dequantizes to exactly the values below.
+	const __half half_scale = __float2half(sdata[0] / (float)q_max);
+	const float scale = __half2float(half_scale);
+
+	if (tid == 0) {
+		scales[blockIdx.x] = half_scale;
+	}
+
+	if (i >= n_params) {
+		return;
+	}
+
+	const int q = scale > 0.0f ? min(max((int)rintf(v / scale), -q_max), q_max) : 0;
+	quantized[i] = (int16_t)q;
+	params[i] = (network_precision_t)(scale * (float)q);
+}
+
+void Testbed::quantize_network_params(uint32_t n_bits) {
+	if (!m_trainer) {
+		throw std::runtime_error{"Quantization requires a network."};
+	}
+
+	if (n_bits < 2 || n_bits > 16) {
+		throw std::runtime_error{"--quantize-bits must be between 2 and 16."};
+	}
+
+	auto start = std::chrono::steady_clock::now();
+
+	const size_t n_params = m_trainer->n_params();
+	const size_t n_blocks = div_round_up(n_params, (size_t)QUANTIZATION_BLOCK_SIZE);
+	const int q_max = (1 << (n_bits - 1)) - 1;
+
+	std::vector<int16_t> quantized_host(n_params);
+	std::vector<uint16_t> scales_host(n_blocks);
+
+	{
+		GPUMemory<int16_t> quantized(n_params);
+		GPUMemory<__half> scales(n_blocks);
+
+		quantize_params_kernel<<<(uint32_t)n_blocks, QUANTIZATION_BLOCK_SIZE>>>(
+			n_params, q_max, m_trainer->params_inference(), quantized.data(), scales.data()
+		);
+		CUDA_CHECK_THROW(cudaDeviceSynchronize());
+
+		quantized.copy_to_host(quantized_host);
+		CUDA_CHECK_THROW(cudaMemcpy(scales_host.data(), scales.data(), n_blocks * sizeof(__half), cudaMemcpyDeviceToHost));
+	}
+
+	// The trainer's inference params alias its training params for this precision, but keep the two in sync explicitly
+	// in case that ever changes.
+	if (m_trainer->params() != m_trainer->params_inference()) {
+		CUDA_CHECK_THROW(cudaMemcpy(
+			m_trainer->params(), m_trainer->params_inference(), n_params * sizeof(network_precision_t), cudaMemcpyDeviceToDevice
+		));
+	}
+
+	const size_t bytes_per_value = n_bits <= 8 ? 1 : 2;
+	const size_t scales_bytes = n_blocks * sizeof(uint16_t);
+	const size_t blob_bytes = scales_bytes + n_params * bytes_per_value;
+
+	std::vector<uint8_t> blob(blob_bytes);
+	std::memcpy(blob.data(), scales_host.data(), scales_bytes);
+	if (bytes_per_value == 1) {
+		for (size_t i = 0; i < n_params; ++i) {
+			blob[scales_bytes + i] = (uint8_t)(int8_t)quantized_host[i];
+		}
+	} else {
+		std::memcpy(blob.data() + scales_bytes, quantized_host.data(), n_params * sizeof(int16_t));
+	}
+
+	std::vector<uint8_t> compressed(blob_bytes + BLOSC_MAX_OVERHEAD);
+	const int compressed_bytes = blosc_compress_ctx(
+		9, BLOSC_NOSHUFFLE, bytes_per_value, blob_bytes, blob.data(), compressed.data(), compressed.size(), "zstd", 0, 8
+	);
+	if (compressed_bytes <= 0) {
+		throw std::runtime_error{fmt::format("Failed to compress the quantized parameters ({}).", compressed_bytes)};
+	}
+
+	const fs::path raw_path = fmt::format("quantized_params_{}bit.bin", n_bits);
+	const fs::path compressed_path = fmt::format("quantized_params_{}bit.blosc", n_bits);
+
+	std::ofstream raw_file{native_string(raw_path), std::ios::out | std::ios::binary};
+	raw_file.write((const char*)blob.data(), blob_bytes);
+	std::ofstream compressed_file{native_string(compressed_path), std::ios::out | std::ios::binary};
+	compressed_file.write((const char*)compressed.data(), compressed_bytes);
+
+	tlog::info() << fmt::format(
+		"Quantized {} params to {} bit (block={}, blocks={}): fp16_bytes={} raw_bytes={} zstd_bytes={} -> '{}' (took {})",
+		n_params,
+		n_bits,
+		QUANTIZATION_BLOCK_SIZE,
+		n_blocks,
+		n_params * sizeof(network_precision_t),
+		blob_bytes,
+		compressed_bytes,
+		compressed_path.str(),
+		tlog::durationToString(std::chrono::steady_clock::now() - start)
+	);
+}
+
 } // namespace ngp

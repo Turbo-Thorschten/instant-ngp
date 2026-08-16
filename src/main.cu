@@ -103,6 +103,20 @@ int main_func(const std::vector<std::string>& arguments) {
 		{"save-slices"},
 	};
 
+	Flag psnr_volume_flag{
+		parser,
+		"PSNR_VOLUME",
+		"Computes the PSNR over all voxels of level 0 at s=0 upon quitting. ScalarVolume mode only.",
+		{"psnr-volume"},
+	};
+
+	ValueFlag<uint32_t> quantize_bits_flag{
+		parser,
+		"QUANTIZE_BITS",
+		"Quantizes the network's inference parameters to this many bits after training and re-runs the evaluation. 0 disables.",
+		{"quantize-bits"},
+	};
+
 	ValueFlag<uint32_t> curriculum_steps_flag{
 		parser,
 		"CURRICULUM_STEPS",
@@ -237,8 +251,21 @@ int main_func(const std::vector<std::string>& arguments) {
 		}
 	}
 
-	if (save_slices_flag) {
-		testbed.save_scalar_volume_slices(get(save_slices_flag));
+	auto evaluate = [&]() {
+		if (psnr_volume_flag) {
+			testbed.scalar_volume_psnr();
+		}
+
+		if (save_slices_flag) {
+			testbed.save_scalar_volume_slices(get(save_slices_flag));
+		}
+	};
+
+	evaluate();
+
+	if (quantize_bits_flag && get(quantize_bits_flag) > 0) {
+		testbed.quantize_network_params(get(quantize_bits_flag));
+		evaluate();
 	}
 
 	return 0;

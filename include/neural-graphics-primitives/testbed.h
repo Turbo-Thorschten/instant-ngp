@@ -332,6 +332,8 @@ public:
 	void training_prep_scalar_volume(uint32_t batch_size, cudaStream_t stream) {}
 	void load_scalar_volume(const fs::path& data_path);
 	void save_scalar_volume_slices(const fs::path& dir);
+	void scalar_volume_psnr();
+	void quantize_network_params(uint32_t n_bits);
 
 	void render_nerf(
 		cudaStream_t stream,
