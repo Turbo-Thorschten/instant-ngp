@@ -253,6 +253,21 @@ endif()
 add_subdirectory("dependencies/zstr")
 list(APPEND NGP_LIBRARIES zstr::zstr)
 
+# c-blosc decompresses zarr chunks. Only zstd is needed for that.
+set(BUILD_SHARED OFF CACHE BOOL " " FORCE)
+set(BUILD_STATIC ON CACHE BOOL " " FORCE)
+set(BUILD_TESTS OFF CACHE BOOL " " FORCE)
+set(BUILD_FUZZERS OFF CACHE BOOL " " FORCE)
+set(BUILD_BENCHMARKS OFF CACHE BOOL " " FORCE)
+set(DEACTIVATE_LZ4 ON CACHE BOOL " " FORCE)
+set(DEACTIVATE_SNAPPY ON CACHE BOOL " " FORCE)
+set(DEACTIVATE_ZLIB ON CACHE BOOL " " FORCE)
+set(PREFER_EXTERNAL_ZSTD OFF CACHE BOOL " " FORCE)
+add_subdirectory("dependencies/c-blosc")
+set_property(TARGET blosc_static PROPERTY FOLDER "dependencies")
+
+list(APPEND NGP_LIBRARIES blosc_static)
+
 
 ###############################################################################
 # Program
@@ -273,6 +288,7 @@ list(APPEND NGP_SOURCES
 	src/testbed.cu
 	src/testbed_image.cu
 	src/testbed_nerf.cu
+	src/testbed_scalar_volume.cu
 	src/testbed_sdf.cu
 	src/testbed_volume.cu
 	src/thread_pool.cpp

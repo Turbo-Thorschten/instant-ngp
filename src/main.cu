@@ -89,6 +89,20 @@ int main_func(const std::vector<std::string>& arguments) {
 		{"snapshot", "load_snapshot"},
 	};
 
+	ValueFlag<uint32_t> n_steps_flag{
+		parser,
+		"N_STEPS",
+		"Number of training steps after which to quit.",
+		{"n-steps"},
+	};
+
+	ValueFlag<string> save_slices_flag{
+		parser,
+		"SAVE_SLICES",
+		"Directory to write gt_slice.png and pred_slice.png into upon quitting. ScalarVolume mode only.",
+		{"save-slices"},
+	};
+
 	ValueFlag<uint32_t> width_flag{
 		parser,
 		"WIDTH",
@@ -185,6 +199,14 @@ int main_func(const std::vector<std::string>& arguments) {
 		if (!gui) {
 			tlog::info() << "iteration=" << testbed.m_training_step << " loss=" << testbed.m_loss_scalar.val();
 		}
+
+		if (n_steps_flag && testbed.m_training_step >= get(n_steps_flag)) {
+			break;
+		}
+	}
+
+	if (save_slices_flag) {
+		testbed.save_scalar_volume_slices(get(save_slices_flag));
 	}
 
 	return 0;

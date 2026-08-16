@@ -1,0 +1,6 @@
+{
+	"parent": "base.json",
+	"encoding": {
+		"interpolation": "Smoothstep"
+	}
+}

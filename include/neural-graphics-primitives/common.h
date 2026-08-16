@@ -151,6 +151,7 @@ enum class ETestbedMode : int {
 	Sdf,
 	Image,
 	Volume,
+	ScalarVolume,
 	None,
 };
 

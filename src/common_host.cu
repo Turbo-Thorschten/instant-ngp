@@ -147,7 +147,10 @@ ETestbedMode mode_from_scene(const std::string& scene) {
 		return ETestbedMode::None;
 	}
 
-	if (scene_path.is_directory() || equals_case_insensitive(scene_path.extension(), "json")) {
+	// Must precede the directory check below: a zarr store is a directory.
+	if (equals_case_insensitive(scene_path.extension(), "zarr")) {
+		return ETestbedMode::ScalarVolume;
+	} else if (scene_path.is_directory() || equals_case_insensitive(scene_path.extension(), "json")) {
 		return ETestbedMode::Nerf;
 	} else if (equals_case_insensitive(scene_path.extension(), "obj") || equals_case_insensitive(scene_path.extension(), "stl")) {
 		return ETestbedMode::Sdf;
@@ -168,6 +171,8 @@ ETestbedMode mode_from_string(const std::string& str) {
 		return ETestbedMode::Image;
 	} else if (equals_case_insensitive(str, "volume")) {
 		return ETestbedMode::Volume;
+	} else if (equals_case_insensitive(str, "scalarvolume")) {
+		return ETestbedMode::ScalarVolume;
 	} else {
 		return ETestbedMode::None;
 	}
@@ -179,6 +184,7 @@ std::string to_string(ETestbedMode mode) {
 		case ETestbedMode::Sdf: return "sdf";
 		case ETestbedMode::Image: return "image";
 		case ETestbedMode::Volume: return "volume";
+		case ETestbedMode::ScalarVolume: return "scalarvolume";
 		case ETestbedMode::None: return "none";
 		default: throw std::runtime_error{fmt::format("Can not convert mode {} to string.", (int)mode)};
 	}

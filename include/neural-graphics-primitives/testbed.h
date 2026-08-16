@@ -317,6 +317,7 @@ public:
 	};
 
 	NetworkDims network_dims_volume() const;
+	NetworkDims network_dims_scalar_volume() const;
 	NetworkDims network_dims_sdf() const;
 	NetworkDims network_dims_image() const;
 	NetworkDims network_dims_nerf() const;
@@ -326,6 +327,11 @@ public:
 	void train_volume(size_t target_batch_size, bool get_loss_scalar, cudaStream_t stream);
 	void training_prep_volume(uint32_t batch_size, cudaStream_t stream) {}
 	void load_volume(const fs::path& data_path);
+
+	void train_scalar_volume(size_t target_batch_size, bool get_loss_scalar, cudaStream_t stream);
+	void training_prep_scalar_volume(uint32_t batch_size, cudaStream_t stream) {}
+	void load_scalar_volume(const fs::path& data_path);
+	void save_scalar_volume_slices(const fs::path& dir);
 
 	void render_nerf(
 		cudaStream_t stream,
@@ -366,6 +372,15 @@ public:
 		int visualized_dimension
 	);
 	void render_volume(
+		cudaStream_t stream,
+		const CudaRenderBufferView& render_buffer,
+		const vec2& focal_length,
+		const mat4x3& camera_matrix,
+		const vec2& screen_center,
+		const Foveation& foveation,
+		const Lens& lens
+	);
+	void render_scalar_volume(
 		cudaStream_t stream,
 		const CudaRenderBufferView& render_buffer,
 		const vec2& focal_length,
@@ -969,6 +984,19 @@ public:
 
 		ERandomMode random_mode = ERandomMode::Stratified;
 	} m_image;
+
+	struct ScalarVolume {
+		GPUMemory<uint8_t> data;
+		ivec3 resolution = ivec3(0);
+
+		GPUMemory<vec3> render_coords;
+		GPUMemory<float> render_out;
+
+		struct Training {
+			GPUMemory<vec3> positions;
+			GPUMemory<float> targets;
+		} training = {};
+	} m_scalar_volume;
 
 	struct VolPayload {
 		vec3 dir;

@@ -173,6 +173,7 @@ void Testbed::load_training_data(const fs::path& path) {
 		case ETestbedMode::Sdf: load_mesh(path); break;
 		case ETestbedMode::Image: load_image(path); break;
 		case ETestbedMode::Volume: load_volume(path); break;
+		case ETestbedMode::ScalarVolume: load_scalar_volume(path); break;
 		default: throw std::runtime_error{"Invalid testbed mode."};
 	}
 
@@ -203,6 +204,7 @@ void Testbed::set_mode(ETestbedMode mode) {
 	m_nerf = {};
 	m_sdf = {};
 	m_volume = {};
+	m_scalar_volume = {};
 
 	// Kill training-related things
 	m_encoding = {};
@@ -232,6 +234,10 @@ void Testbed::set_mode(ETestbedMode mode) {
 		}
 	} else {
 		m_use_aux_devices = false;
+	}
+
+	if (m_testbed_mode == ETestbedMode::ScalarVolume) {
+		m_render_mode = ERenderMode::Slice;
 	}
 
 	if (
@@ -4153,6 +4159,7 @@ Testbed::NetworkDims Testbed::network_dims() const {
 		case ETestbedMode::Sdf: return network_dims_sdf(); break;
 		case ETestbedMode::Image: return network_dims_image(); break;
 		case ETestbedMode::Volume: return network_dims_volume(); break;
+		case ETestbedMode::ScalarVolume: return network_dims_scalar_volume(); break;
 		default: throw std::runtime_error{"Invalid mode."};
 	}
 }
@@ -4243,6 +4250,8 @@ void Testbed::reset_network(bool clear_density_grid) {
 			desired_resolution = max(m_image.resolution) / 2.0f;
 		} else if (m_testbed_mode == ETestbedMode::Volume) {
 			desired_resolution = m_volume.world2index_scale;
+		} else if (m_testbed_mode == ETestbedMode::ScalarVolume) {
+			desired_resolution = (float)max(m_scalar_volume.resolution);
 		}
 
 		// Automatically determine suitable per_level_scale
@@ -4607,6 +4616,7 @@ void Testbed::train(uint32_t batch_size) {
 			case ETestbedMode::Sdf: training_prep_sdf(batch_size, m_stream.get()); break;
 			case ETestbedMode::Image: training_prep_image(batch_size, m_stream.get()); break;
 			case ETestbedMode::Volume: training_prep_volume(batch_size, m_stream.get()); break;
+			case ETestbedMode::ScalarVolume: training_prep_scalar_volume(batch_size, m_stream.get()); break;
 			default: throw std::runtime_error{"Invalid training mode."};
 		}
 
@@ -4635,6 +4645,7 @@ void Testbed::train(uint32_t batch_size) {
 			case ETestbedMode::Sdf: train_sdf(batch_size, get_loss_scalar, m_stream.get()); break;
 			case ETestbedMode::Image: train_image(batch_size, get_loss_scalar, m_stream.get()); break;
 			case ETestbedMode::Volume: train_volume(batch_size, get_loss_scalar, m_stream.get()); break;
+			case ETestbedMode::ScalarVolume: train_scalar_volume(batch_size, get_loss_scalar, m_stream.get()); break;
 			default: throw std::runtime_error{"Invalid training mode."};
 		}
 
@@ -4986,6 +4997,9 @@ void Testbed::render_frame_main(
 			break;
 		case ETestbedMode::Volume:
 			render_volume(device.stream(), device.render_buffer_view(), focal_length, camera_matrix0, screen_center, foveation, lens);
+			break;
+		case ETestbedMode::ScalarVolume:
+			render_scalar_volume(device.stream(), device.render_buffer_view(), focal_length, camera_matrix0, screen_center, foveation, lens);
 			break;
 		default:
 			// No-op if no mode is active
