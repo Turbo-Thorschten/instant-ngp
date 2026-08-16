@@ -103,6 +103,13 @@ int main_func(const std::vector<std::string>& arguments) {
 		{"save-slices"},
 	};
 
+	ValueFlag<uint32_t> curriculum_steps_flag{
+		parser,
+		"CURRICULUM_STEPS",
+		"Number of training steps after which the next finer ScalarVolume level is unlocked. 0 disables the curriculum.",
+		{"curriculum-steps"},
+	};
+
 	ValueFlag<uint32_t> width_flag{
 		parser,
 		"WIDTH",
@@ -163,6 +170,10 @@ int main_func(const std::vector<std::string>& arguments) {
 	}
 
 	Testbed testbed;
+
+	if (curriculum_steps_flag) {
+		testbed.m_scalar_volume_curriculum_steps = get(curriculum_steps_flag);
+	}
 
 	for (auto file : get(files)) {
 		testbed.load_file(file);

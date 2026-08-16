@@ -985,15 +985,29 @@ public:
 		ERandomMode random_mode = ERandomMode::Stratified;
 	} m_image;
 
-	struct ScalarVolume {
-		GPUMemory<uint8_t> data;
-		ivec3 resolution = ivec3(0);
+	uint32_t m_scalar_volume_curriculum_steps = 250;
 
-		GPUMemory<vec3> render_coords;
+	struct ScalarVolume {
+		struct Level {
+			GPUMemory<uint8_t> vram;
+			const uint8_t* data = nullptr;
+			ivec3 resolution = ivec3(0);
+			ivec3 begin = ivec3(0);
+		};
+
+		std::vector<Level> levels;
+
+		// Level 0, which spans the normalized [0,1]^3 that all levels are sampled in.
+		ivec3 resolution = ivec3(0);
+		ivec3 begin = ivec3(0);
+
+		uint32_t n_unlocked_levels = 0;
+
+		GPUMemory<vec4> render_coords;
 		GPUMemory<float> render_out;
 
 		struct Training {
-			GPUMemory<vec3> positions;
+			GPUMemory<vec4> positions;
 			GPUMemory<float> targets;
 		} training = {};
 	} m_scalar_volume;

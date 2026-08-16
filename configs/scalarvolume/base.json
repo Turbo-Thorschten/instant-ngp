@@ -16,15 +16,30 @@
 			"l2_reg": 1e-6
 		}
 	},
+	// Composite over (position, scale). Because the outer otype is not a grid,
+	// testbed.cu's automatic hashgrid parameterization does not kick in, so
+	// per_level_scale has to be spelled out: exp(ln(1792/16)/15) for the 1792^3
+	// level-0 box of the scroll block.
 	"encoding": {
-		"otype": "HashGrid",
-		"n_levels": 16,
-		"n_features_per_level": 2,
-		// 2^24 entries per level would need ~536M params, whose fp32 Adam state
-		// does not fit into 16 GB next to the 5.4 GiB ground-truth volume.
-		"log2_hashmap_size": 22,
-		"base_resolution": 16,
-		"interpolation": "Linear"
+		"otype": "Composite",
+		"nested": [
+			{
+				"n_dims_to_encode": 3,
+				"otype": "HashGrid",
+				"n_levels": 16,
+				"n_features_per_level": 2,
+				// 2^24 entries per level would need ~536M params, whose fp32 Adam state
+				// does not fit into 16 GB next to the 5.4 GiB ground-truth volume.
+				"log2_hashmap_size": 22,
+				"base_resolution": 16,
+				"per_level_scale": 1.369666,
+				"interpolation": "Linear"
+			},
+			{
+				"otype": "OneBlob",
+				"n_bins": 16
+			}
+		]
 	},
 	"network": {
 		"otype": "FullyFusedMLP",
